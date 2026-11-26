@@ -1,0 +1,313 @@
+---
+title: "Groepswerk"
+output: html_document
+date: "2026-11-19"
+---
+#Explore the data
+```{r}
+#Tidyverse bibliotheek laden
+#install.packages("tidyverse")
+library(tidyverse)
+```
+
+```{r}
+#Data inladen met read_csv() uit de readr package (maakt een tibble)
+metadata <- read_csv("GSE80655_metadata.csv")
+counts <- read_csv("GSE80655_counts.csv")
+```
+
+```{r}
+# Eerste rijen bekijken met head()
+head(metadata)
+head(counts)
+```
+
+```{r}
+# Afmetingen van de data controleren (aantal genen en samples)
+nrow(counts)    # Aantal genen (features)
+ncol(counts)    # Aantal RNA-seq samples + gennaam kolom
+nrow(metadata)  # Aantal samples/observaties in metadata
+```
+
+```{r}
+# Kolomtypes inspecteren met str()
+str(metadata)
+```
+```{r}
+# Categorische (nominale/ordinale) variabelen omzetten naar factor
+# Dit kan direct op de kolommen of met mutate() en pipes (%>%):
+metadata$diagnosis <- as.factor(metadata$diagnosis)
+metadata$brain_region <- as.factor(metadata$brain_region)
+metadata$sex <- as.factor(metadata$sex)
+metadata$ethnicity <- as.factor(metadata$ethnicity)
+```
+
+```{r}
+# Bekijk de aangepaste structuur en samenvattende statistieken
+str(metadata)
+summary(metadata)
+```
+# Missing values (NA)
+```{r}
+# Totaal aantal NA's per variabele in de metadata berekenen
+colSums(is.na(metadata))
+```
+```{r}
+# Tidyverse variant met summarise() om het aantal NA's overzichtelijk te bekijken
+metadata %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+```
+```{r}
+# Controleer of er eventueel NA's in de count-matrix zitten
+sum(is.na(counts))
+```
+```{r}
+# Optioneel: Als een sample een ontbrekende waarde heeft voor een belangrijke variabele,
+# kun je deze filteren met drop_na() of filter(!is.na(...))
+#metadata_clean <- metadata %>%
+  #drop_na(pH, PMI, Age)
+```
+
+# Outliers
+```{r}
+# Samenvattende statistieken (min, kwantielen, mediaan, max) van continue variabelen
+metadata %>%
+  select(where(is.numeric)) %>%
+  summary()
+```
+```{r}
+# Visualize the distribution of brain pH (verifying minimal threshold pH >= 6.5)
+metadata %>%
+  ggplot(aes(x = brain_pH)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "black") +
+  theme_classic() +
+  labs(title = "Brain pH Distribution",
+       x = "Brain pH",
+       y = "Sample Count")
+```
+```{r}
+# Visualize Post-Mortem Interval (PMI) across diagnosis groups to detect outliers
+metadata %>%
+  ggplot(aes(x = diagnosis, y = PMI, fill = diagnosis)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(title = "Post-Mortem Interval (PMI) by Diagnosis Group",
+       x = "Diagnosis",
+       y = "PMI (hours)")
+```
+# Quality control
+```{r}
+# Select numeric count columns only
+counts_numeric <- counts %>%
+  select(where(is.numeric))
+# Calculate total sequencing depth per sample (Library Size)
+library_sizes <- colSums(counts_numeric)
+# View summary statistics of library sizes
+summary(library_sizes)
+```
+
+```{r}
+# Convert to a tibble for ggplot2 visualization
+library_sizes_df <- tibble(
+  Sample_ID = names(library_sizes),
+  Total_Counts = library_sizes
+)
+```
+
+```{r}
+# Visualize the distribution of library sizes to identify samples with low read counts
+library_sizes_df %>%
+  ggplot(aes(x = Total_Counts)) +
+  geom_histogram(bins = 30, fill = "darkseagreen", color = "black") +
+  theme_classic() +
+  labs(title = "Distribution of Library Sizes",
+       x = "Total Read Counts",
+       y = "Sample Count")
+```
+
+```{r}
+# Join library sizes with metadata using the 'description' column
+library_sizes_df %>%
+  left_join(metadata, by = c("Sample_ID" = "description")) %>%
+  ggplot(aes(x = diagnosis, y = Total_Counts, fill = diagnosis)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(title = "Sequencing Depth by Diagnosis Group",
+       x = "Diagnosis",
+       y = "Total Read Counts")
+```
+#Preprocessing
+```{r}
+# Load the edgeR package (install via BiocManager::install("edgeR") if needed)
+#BiocManager::install("edgeR")
+install.packages("BiocManager")
+BiocManager::install("edgeR")
+library(edgeR)
+library(tidyverse)
+```
+
+```{r}
+# Convert counts dataframe to a matrix with gene IDs as rownames
+gene_col <- colnames(counts)[1] # Identifies the first column (e.g., 'gene_id')
+
+counts_matrix <- counts %>%
+  column_to_rownames(var = gene_col) %>%
+  as.matrix()
+```
+
+```{r}
+# Align metadata order with counts matrix column order
+metadata_aligned <- metadata %>%
+  arrange(match(description, colnames(counts_matrix)))
+```
+
+```{r}
+# Verify exact match between count matrix columns and metadata sample IDs
+stopifnot(all(colnames(counts_matrix) == metadata_aligned$description))
+```
+
+```{r}
+# Create DGEList object (edgeR standard container)
+dge <- DGEList(counts = counts_matrix, group = metadata_aligned$diagnosis)
+cat("Original count matrix dimensions (Genes x Samples):", dim(dge), "\n")
+```
+```{r}
+# Filter low-expressed genes using Counts Per Million (CPM)
+# Keep genes expressed at CPM >= 1 in at least 24 samples (size of smallest diagnosis group)
+keep <- rowSums(cpm(dge) >= 1) >= 24
+dge_filtered <- dge[keep, , keep.lib.sizes = FALSE]
+cat("Filtered matrix dimensions (Genes x Samples):", dim(dge_filtered), "\n")
+```
+
+```{r}
+# Calculate TMM Normalization Factors
+dge_normalized <- calcNormFactors(dge_filtered, method = "TMM")
+```
+```{r}
+# Inspect sample library sizes and normalization factors
+head(dge_normalized$samples)
+```
+
+```{r}
+# Extract normalized log2-CPM matrix for downstream analysis (PCA, ML, Limma)
+log_cpm_matrix <- cpm(dge_normalized, log = TRUE, prior.count = 0.1)
+```
+
+#visualisation effect of normalization
+```{r}
+# Select first 10 samples for visual comparison
+sample_subset <- colnames(log_cpm_matrix)[1:10]
+
+# Prepare RAW counts for plotting (log10 transformed)
+raw_log_df <- counts_matrix[keep, sample_subset] %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene_ID") %>%
+  pivot_longer(cols = -Gene_ID, names_to = "Sample_ID", values_to = "Log_Count")
+
+# Plot RAW count distributions
+raw_log_df %>%
+  ggplot(aes(x = Sample_ID, y = log10(Log_Count + 1), fill = Sample_ID)) +
+  geom_boxplot(show.legend = FALSE) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Raw Expression Distribution (Log10 Counts + 1)",
+       x = "Sample ID",
+       y = "log10(Count + 1)")
+
+# Prepare NORMALIZED counts (log2-CPM) for plotting
+norm_log_df <- log_cpm_matrix[, sample_subset] %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene_ID") %>%
+  pivot_longer(cols = -Gene_ID, names_to = "Sample_ID", values_to = "LogCPM")
+
+# Plot NORMALIZED log2-CPM distributions
+norm_log_df %>%
+  ggplot(aes(x = Sample_ID, y = LogCPM, fill = Sample_ID)) +
+  geom_boxplot(show.legend = FALSE) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Normalized Expression Distribution (TMM log2-CPM)",
+       x = "Sample ID",
+       y = "log2-CPM")
+```
+#Calculate the PCA
+```{r}
+# Transpose log2-CPM matrix (samples in rows, genes in columns) for prcomp()
+pca_res <- prcomp(t(log_cpm_matrix))
+```
+
+```{r}
+# Extract variance explained per PC (sdev^2) and visualize the top 20 components
+pca_res$sdev^2 %>%
+  as_tibble(rownames = NA) %>%
+  rename(pca_var = 1) %>%
+  mutate(
+    percentage = round(pca_var / sum(pca_var) * 100, 1),
+    component_number = rank(-percentage, ties.method = "random")
+  ) %>%
+  filter(component_number <= 20) %>%
+  ggplot(aes(x = component_number, y = percentage)) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "black") +
+  theme_classic() +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "Scree Plot: Variance Explained per Principal Component",
+       x = "Principal Component Number",
+       y = "Percentage of Variance Explained (%)")
+```
+
+```{r}
+# Extract component coordinates (x) and join with metadata via 'description'
+pca_df <- pca_res$x %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column("Sample_ID") %>%
+  left_join(metadata, by = c("Sample_ID" = "description"))
+```
+
+```{r}
+# PCA colored by Brain Region (Primary Biological Driver)
+pca_df %>%
+  ggplot(aes(x = PC1, y = PC2, color = brain_region)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  theme_classic() +
+  labs(title = "PCA Plot: Grouping by Brain Region",
+       x = "PC1",
+       y = "PC2",
+       color = "Brain Region")
+
+```
+```{r}
+# B. PCA colored by Diagnosis Group
+pca_df %>%
+  ggplot(aes(x = PC1, y = PC2, color = diagnosis)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  theme_classic() +
+  labs(title = "PCA Plot: Grouping by Diagnosis",
+       x = "PC1",
+       y = "PC2",
+       color = "Diagnosis")
+```
+```{r}
+# PCA colored by Sex (Checking demographic batch effect)
+pca_df %>%
+  ggplot(aes(x = PC1, y = PC2, color = sex)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  theme_classic() +
+  labs(title = "PCA Plot: Inspection of Sex Effect",
+       x = "PC1",
+       y = "PC2",
+       color = "Sex")
+```
+```{r}
+# D. PCA colored by Brain pH (Checking tissue quality covariate)
+pca_df %>%
+  ggplot(aes(x = PC1, y = PC2, color = brain_pH)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_viridis_c() +
+  theme_classic() +
+  labs(title = "PCA Plot: Inspection of Brain pH Gradient",
+       x = "PC1",
+       y = "PC2",
+       color = "Brain pH")
+```
+
